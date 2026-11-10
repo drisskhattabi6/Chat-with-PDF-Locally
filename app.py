@@ -1,303 +1,550 @@
-import os, re, io
-import shutil
-import logging
-import subprocess
-from PIL import Image
+import io
+from pathlib import Path
+
 import streamlit as st
-# -------------------------------
-import pymupdf4llm
-from marker.converters.pdf import PdfConverter
-from marker.models import create_model_dict
-# -------------------------------
-from langchain_ollama import OllamaEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma 
-from langchain.schema import Document 
-# -------------------------------
-from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import simpleSplit
-# -------------------------------
-from rag import RAGSystem
-from md_convertor import Convert2Markdown
+from reportlab.pdfgen import canvas
 
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+from chunking import CHUNKING_LABELS, chunk_document
+from config import SETTINGS
+from embeddings import build_embedder
+from pdf_extractors import EXTRACTOR_LABELS, extract_pdf
+from providers import PROVIDER_PRESETS, build_chat_client, get_default_api_key
+from rag import RAGService
+from utils import (
+    build_collection_name,
+    get_logger,
+    human_duration,
+    list_ollama_models,
+    read_json,
+    safe_filename,
+    sha256_bytes,
+    write_json,
+)
+from vector_store import ChromaVectorStore, delete_collection
 
-# Set up logging
-logger = logging.getLogger(__name__)
-logger.info(f"Streamlit app is running")
+SETTINGS.ensure_directories()
+logger = get_logger()
 
-# Function to generate PDF
-def generate_pdf():
+st.set_page_config(page_title=SETTINGS.app_name, page_icon="📄", layout="wide")
+
+
+def init_state() -> None:
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "upload_hash" not in st.session_state:
+        st.session_state.upload_hash = ""
+    if "active_manifest" not in st.session_state:
+        st.session_state.active_manifest = None
+    if "fetched_models" not in st.session_state:
+        st.session_state.fetched_models = {}
+
+
+def generate_chat_pdf(messages: list[dict], manifest: dict | None) -> bytes:
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
+    pdf = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
 
-    y = height - 40  # Start position for text
-    max_width = width - 80  # Margin for text wrapping
+    y = height - 40
+    margin_x = 40
+    line_height = 16
+    max_width = width - (margin_x * 2)
 
-    c.setFont("Helvetica-Bold", 16)
-    header_text = "Conversation History"
-    text_width = c.stringWidth(header_text, "Helvetica-Bold", 16)
-    c.drawString((width - text_width) / 2, height - 40, header_text)
+    pdf.setFont("Helvetica-Bold", 16)
+    title = "Conversation History"
+    title_width = pdf.stringWidth(title, "Helvetica-Bold", 16)
+    pdf.drawString((width - title_width) / 2, y, title)
 
-    y -= 30  # Adjust position after header
-    c.setFont("Helvetica", 12)
+    y -= 25
+    pdf.setFont("Helvetica", 10)
 
-    for msg in st.session_state.messages:
-        role = "User" if msg["role"] == "user" else "LLM"
+    if manifest:
+        doc_line = f"PDF: {manifest.get('pdf_name', 'Unknown')} | Extractor: {manifest.get('extractor', '')} | Chunking: {manifest.get('chunk_method', '')}"
+        for line in simpleSplit(doc_line, pdf._fontname, pdf._fontsize, max_width):
+            pdf.drawString(margin_x, y, line)
+            y -= line_height
+
+    y -= 10
+    pdf.setFont("Helvetica", 11)
+
+    for msg in messages:
+        role = "User" if msg["role"] == "user" else "Assistant"
         text = f"{role}: {msg['content']}"
 
-        # Separate user questions with a line
-        if msg["role"] == "user":
-            y -= 10
-            c.setStrokeColorRGB(0, 0, 0)
-            c.line(40, y, width - 40, y)
-            y -= 20  
+        wrapped = simpleSplit(text, pdf._fontname, pdf._fontsize, max_width)
+        for line in wrapped:
+            if y < 50:
+                pdf.showPage()
+                pdf.setFont("Helvetica", 11)
+                y = height - 40
+            pdf.drawString(margin_x, y, line)
+            y -= line_height
 
-        # Wrap text within max_width
-        wrapped_lines = simpleSplit(text, c._fontname, c._fontsize, max_width)
+        if msg.get("meta_caption"):
+            pdf.setFont("Helvetica-Oblique", 9)
+            for line in simpleSplit(msg["meta_caption"], pdf._fontname, pdf._fontsize, max_width):
+                if y < 50:
+                    pdf.showPage()
+                    pdf.setFont("Helvetica-Oblique", 9)
+                    y = height - 40
+                pdf.drawString(margin_x, y, line)
+                y -= 12
+            pdf.setFont("Helvetica", 11)
 
-        for line in wrapped_lines:
-            c.drawString(40, y, line)
-            y -= 20
-            
-            # Handle page breaks
-            if y < 40:
-                c.showPage()
-                c.setFont("Helvetica", 12)
-                y = height - 40  # Reset position after new page
+        y -= 8
 
-    c.save()
+    pdf.save()
     buffer.seek(0)
-    return buffer
+    return buffer.getvalue()
 
-def get_available_models():
-    """Fetches the installed Ollama models, excluding 'NAME' and models containing 'embed'."""
+
+def render_sources(sources: list[dict]) -> None:
+    if not sources:
+        return
+
+    with st.expander("Sources used", expanded=False):
+        for src in sources:
+            metadata = src.get("metadata", {}) or {}
+            label_parts = [src["id"]]
+
+            if metadata.get("page") is not None:
+                label_parts.append(f"page {metadata['page']}")
+            for key in ("h1", "h2", "h3", "h4"):
+                if metadata.get(key):
+                    label_parts.append(f"{key}: {metadata[key]}")
+
+            st.markdown(f"**{' | '.join(label_parts)}**")
+            st.caption(src.get("text", "")[:1200])
+
+
+def render_chat_history() -> None:
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message.get("sources"):
+                render_sources(message["sources"])
+            if message.get("meta_caption"):
+                st.caption(message["meta_caption"])
+
+
+def build_meta_caption(provider_name: str, model_name: str, chat_result, source_count: int) -> str:
+    parts = [
+        f"Provider: {provider_name}",
+        f"Model: {model_name}",
+        f"Latency: {human_duration(chat_result.latency_s)}",
+        f"Retrieved sources: {source_count}",
+    ]
+
+    if chat_result.prompt_tokens is not None:
+        parts.append(f"Prompt tokens: {chat_result.prompt_tokens}")
+    if chat_result.completion_tokens is not None:
+        parts.append(f"Completion tokens: {chat_result.completion_tokens}")
+    if chat_result.total_tokens is not None:
+        parts.append(f"Total tokens: {chat_result.total_tokens}")
+
+    return " | ".join(parts)
+
+
+def try_get_ollama_models(base_url: str) -> list[str]:
     try:
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=True)
-        models = [
-            line.split(" ")[0] for line in result.stdout.strip().split("\n")
-            if line and "NAME" not in line and "embed" not in line.lower()
-        ]
-        return models
-    except subprocess.CalledProcessError as e:
-        print(f"Error fetching models: {e}")
+        return list_ollama_models(base_url)
+    except Exception:
         return []
 
-def remove_tags(text):
-    return re.sub(r"^.*?</think>", "", text, flags=re.DOTALL).strip()
 
-# Fetch available models
-available_models = get_available_models()
-if not available_models:
-    st.error("No installed Ollama models found. Please install one using `ollama pull <model_name>`.")
+init_state()
 
-image2 = Image.open('imgs/ChatPDF3.png')
-st.set_page_config(page_title="Chat with PDF", page_icon=image2)
-
-st.subheader("💬 Chat with PDF :")
+st.title("💬 Chat with PDF")
+st.caption("Refactored for robust indexing, multi-provider LLM support, and selectable chunking.")
 
 with st.sidebar:
-    st.header("💬 Chat with your PDF Locally Using Ollama/OpenRouter")
-    image = Image.open('imgs/ChatPDF3.png')
-    st.image(image)
+    st.header("Document")
 
-    # File uploader for PDF
-    pdf = st.file_uploader("Upload your PDF", type="pdf")
+    uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
 
-# Initialize session state variables
-if 'processing_complete' not in st.session_state:
-    st.session_state.processing_complete = False
+    extractor_key = st.selectbox(
+        "PDF extractor",
+        options=list(EXTRACTOR_LABELS.keys()),
+        format_func=lambda key: EXTRACTOR_LABELS[key],
+    )
 
-if 'pdf_name' not in st.session_state:
-    st.session_state.pdf_name = None
+    chunking_options = ["recursive", "markdown_recursive", "token"]
+    if extractor_key == "pymupdf4llm":
+        chunking_options.append("page_recursive")
 
-with st.sidebar:
+    chunk_method = st.selectbox(
+        "Chunking method",
+        options=chunking_options,
+        format_func=lambda key: CHUNKING_LABELS[key],
+    )
 
-    # chunk_size for splittig
-    chunk_size = st.number_input('chunk size :', min_value=128, max_value=2560, value=512, step=128)
+    chunk_size = st.number_input(
+        "Chunk size",
+        min_value=100,
+        max_value=4000,
+        value=SETTINGS.default_chunk_size,
+        step=100,
+        help="Chars for recursive splitters, tokens for token splitter.",
+    )
 
-    # If a new PDF is uploaded, reset session state
-    if pdf is not None:
-        new_pdf_name = os.path.splitext(pdf.name)[0]
-        
-        if st.session_state.pdf_name != new_pdf_name:
-            st.session_state.pdf_name = new_pdf_name
-            st.session_state.processing_complete = False
+    chunk_overlap = st.number_input(
+        "Chunk overlap",
+        min_value=0,
+        max_value=1200,
+        value=SETTINGS.default_chunk_overlap,
+        step=20,
+    )
 
-            # Remove collection from previous vector database
-            rag_system2 = RAGSystem(collection_name="pdf_content")
-            rag_system2.delete_collection()
-            st.success("Previous chat and collection deleted. Please start a new chat.")
+    st.divider()
+    st.header("Embeddings")
 
-    if pdf is not None and not st.session_state.processing_complete:
-        markdown_path = f"./tmp/{st.session_state.pdf_name}.md"
+    embedding_provider = st.selectbox(
+        "Embedding provider",
+        options=["sentence_transformers", "ollama"],
+        format_func=lambda x: "SentenceTransformers (local)" if x == "sentence_transformers" else "Ollama",
+        index=0 if SETTINGS.default_embedding_provider == "sentence_transformers" else 1,
+    )
 
-        # Choose processing mode
-        processing_mode = st.radio("Choose processing mode:", ("Simple Processing", "Advanced Processing"))
-
-        # Button to start processing
-        start_button = st.button("Start Processing")
-
-        if start_button:
-            # Set processing_complete to True when processing starts
-            st.session_state.processing_complete = True
-            st.session_state.processing_mode = processing_mode  # Store the selected mode
-
-            text = ""
-
-            # put the target pdf in the local folder (in tmp folder)
-            # Remove the tmp folder if it exists
-            if os.path.exists("./tmp"):
-                shutil.rmtree("./tmp")
-
-            # Recreate the tmp folder
-            os.makedirs("./tmp", exist_ok=True)
-
-            pdf_path = f"./tmp/{pdf.name}"
-
-            # Save the uploaded file to disk
-            with open(pdf_path, "wb") as f:
-                f.write(pdf.getbuffer())
-
-            with st.spinner("Processing PDF..."): 
-                # Process PDF based on the selected mode
-                if st.session_state.processing_mode == "Simple Processing":
-                    # Extract text from the uploaded PDF as markdown
-                    text = pymupdf4llm.to_markdown(pdf_path)
-
-                elif st.session_state.processing_mode == "Advanced Processing":
-
-                    artifact_dict = create_model_dict()
-                    converter = PdfConverter(artifact_dict=artifact_dict)
-                    convert2md = Convert2Markdown()
-                    convert2md.pdf_to_markdown(marker_converter=converter, input_pdf=pdf_path, output_directory="./tmp/")
-                    text = convert2md._load_file(markdown_path)
-
-            # Split the text into chunks
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=100)
-            chunks = text_splitter.split_text(text)
-            logger.info(f'Chunks Numbers for {pdf.name} is : {len(chunks)}')
-
-            # Convert chunks into Document objects
-            documents = [Document(page_content=chunk) for chunk in chunks]
-
-            with st.spinner("Generating embeddings..."):
-                # Create embeddings and a vector database
-                vector_db = Chroma.from_documents(
-                    documents=documents,
-                    embedding=OllamaEmbeddings(model="nomic-embed-text:latest"),
-                    collection_name="pdf_content",
-                    persist_directory="./PDF_ChromaDB",
-                )
-
-            st.success("Processing Complete!")
-
-    # User selects the model Provider
-    llm_provider = st.selectbox("Select LLM Provider:", ['Sambanova', 'Ollama'], index=0)
-
-    if llm_provider == 'Ollama' :
-        selected_model = st.selectbox("Select an Ollama model:", available_models, index=0)
-    else : 
-        llm_name = st.selectbox("Enter LLM Name:", ['DeepSeek-R1-Distill-Llama-70B', 'DeepSeek-V3-0324', 'DeepSeek-R1', 'Qwen3-32B', 'QwQ-32B'], index=0)
-        api_key = st.text_input("Enter Sambanova API Key", type="password", value=os.getenv("API_KEY"))
-
-    # Slider to choose the number of retrieved results
-    n_results = st.slider("Number of retrieved documents", min_value=1, max_value=15, value=5)
-
-    # Button to download PDF
-    if st.button("Download Chat as PDF"):
-        pdf_buffer = generate_pdf()
-        st.download_button(
-            label="Download",
-            data=pdf_buffer,
-            file_name="chat_history.pdf",
-            mime="application/pdf"
+    if embedding_provider == "sentence_transformers":
+        embedding_model = st.text_input(
+            "Embedding model",
+            value=SETTINGS.default_embedding_model,
         )
-    
-    if st.button("Clear Chat"):
-        st.session_state.messages = []
-        st.rerun()
-        
-    with st.expander("PDF Proccesing Methods"):
-        st.info("""
-##### There're 2 method to process PDF after uploading: 
-    - Simple Processing : extract the text as markdown from the pdf if the pdf searchable. (Faster)
-    - Advanced Processing : Efficient for Complex PDFs (like Research Papers), extract the text by converting the pdf to markdown using OCR and then search the markdown file. (Slower)
-""")
-
-# Initialize the RAG system
-rag_system = RAGSystem(collection_name="pdf_content", db_path="PDF_ChromaDB", n_results=n_results)
-
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "max_messages" not in st.session_state:
-    st.session_state.max_messages = 50  # 25 user + 25 assistant messages
-
-# Display chat history
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-st.markdown("----")
-
-# Stop if max messages are reached
-if len(st.session_state.messages) >= st.session_state.max_messages:
-    st.info("Notice: The maximum message limit has been reached. clear the chat plz!")
-else:
-    if query := st.chat_input("Ask me ..."):
-        if pdf is None or st.session_state.processing_complete != True :
-            st.error("Please upload at least one PDF file.")
+        embedding_base_url = ""
+    else:
+        embedding_base_url = st.text_input(
+            "Ollama base URL",
+            value=SETTINGS.ollama_base_url,
+        )
+        embedding_ollama_models = try_get_ollama_models(embedding_base_url)
+        if embedding_ollama_models:
+            default_embed_index = 0
+            if "nomic-embed-text:latest" in embedding_ollama_models:
+                default_embed_index = embedding_ollama_models.index("nomic-embed-text:latest")
+            embedding_model = st.selectbox(
+                "Embedding model",
+                options=embedding_ollama_models,
+                index=default_embed_index,
+            )
         else:
-            st.session_state.messages.append({"role": "user", "content": query})
-            with st.chat_message("user"):
-                st.markdown(query)
+            embedding_model = st.text_input(
+                "Embedding model",
+                value="nomic-embed-text:latest",
+            )
 
-            with st.chat_message("assistant"):
-                try:
-                    with st.spinner("Thinking..."):
+    retrieval_k = st.slider(
+        "Retrieved chunks for answer",
+        min_value=1,
+        max_value=12,
+        value=SETTINGS.default_retrieval_k,
+    )
 
-                        if llm_provider == 'Ollama' :
+    st.divider()
+    st.header("Answer model")
 
-                            llm_response, time, docs_nbrs , input_token_count, output_token_count = rag_system.generate_response(query.strip(), selected_model)
+    provider_name = st.selectbox(
+        "LLM provider",
+        options=list(PROVIDER_PRESETS.keys()),
+    )
+    provider_preset = PROVIDER_PRESETS[provider_name]
 
-                            response = f"""
-                            {remove_tags(llm_response)}
+    llm_base_url = st.text_input("Base URL", value=provider_preset.base_url)
 
-                            \n----
-                            LLM Name: {selected_model} | Response Time: {time} | Input Tokens Count : {input_token_count} | Output Tokens Count : {output_token_count} | Number of Retrieved Documents: {docs_nbrs}
-                            """
-                            st.markdown(response)
+    if provider_preset.needs_api_key:
+        llm_api_key = st.text_input(
+            "API key",
+            type="password",
+            value=get_default_api_key(provider_name),
+        )
+    else:
+        llm_api_key = ""
 
-                        else :
-                            llm_response, time, docs_nbrs , input_token_count, output_token_count  = rag_system.generate_response2(query.strip(), llm_name)
+    fetch_key = f"{provider_name}|{llm_base_url}"
+    fetch_models_button = st.button("Fetch provider models", use_container_width=True)
 
-                            if llm_response == "":
-                                llm_response = "No, response, Maybe the API not available or the model is not installed"
+    if fetch_models_button:
+        try:
+            client = build_chat_client(
+                provider_name=provider_name,
+                base_url=llm_base_url,
+                api_key=llm_api_key,
+            )
+            models = client.list_models()
+            st.session_state.fetched_models[fetch_key] = models
+            st.success(f"Fetched {len(models)} models.")
+        except Exception as exc:
+            st.error(f"Could not fetch models: {exc}")
 
-                            if 'Error' in llm_response:
-                                st.error(llm_response)
-                                response = llm_response
+    if provider_name == "Ollama":
+        auto_models = try_get_ollama_models(llm_base_url)
+        if auto_models:
+            llm_model = st.selectbox("Model", options=auto_models)
+        else:
+            llm_model = st.text_input("Model", value="")
+    else:
+        fetched_models = st.session_state.fetched_models.get(fetch_key, [])
+        if fetched_models:
+            llm_model = st.selectbox("Model", options=fetched_models)
+        else:
+            llm_model = st.text_input("Model", value="")
 
-                            elif 'No Document retrieved' in llm_response:
-                                st.error("No Document retrieved, make sure to add documents to the Vector DB")
-                                response = llm_response
+    temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.1, step=0.1)
+    max_tokens = st.number_input("Max output tokens", min_value=128, max_value=8192, value=1200, step=128)
 
-                            else:
-                                response = f"""
-                                {remove_tags(llm_response)}
+    st.divider()
+    st.header("Actions")
 
-                                \n----
-                                LLM Name: {llm_name} | Response Time: {time} | Input Tokens Count : {input_token_count} | Output Tokens Count : {output_token_count} | Number of Retrieved Documents: {docs_nbrs}
-                                """
-                                st.markdown(response)
+    process_button = st.button("Process / Load index", use_container_width=True)
+    clear_chat_button = st.button("Clear chat", use_container_width=True)
+    delete_index_button = st.button("Delete current index", use_container_width=True)
 
-                        # Store assistant response
-                    st.session_state.messages.append({"role": "assistant", "content": response})
+    download_payload = generate_chat_pdf(st.session_state.messages, st.session_state.active_manifest)
+    st.download_button(
+        "Download chat as PDF",
+        data=download_payload,
+        file_name="chat_history.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+        disabled=not st.session_state.messages,
+    )
 
-                except Exception as e:
-                    st.session_state.messages.append({"role": "assistant", "content": f"Error: {e}"})
-                    st.rerun()
+if clear_chat_button:
+    st.session_state.messages = []
+    st.rerun()
+
+if delete_index_button:
+    manifest = st.session_state.active_manifest
+    if manifest:
+        delete_collection(SETTINGS.chroma_dir, manifest["collection_name"])
+        manifest_path = Path(manifest["manifest_path"])
+        markdown_cache_path = Path(manifest["markdown_cache_path"])
+
+        if manifest_path.exists():
+            manifest_path.unlink()
+        if markdown_cache_path.exists():
+            markdown_cache_path.unlink()
+
+        st.session_state.active_manifest = None
+        st.session_state.messages = []
+        st.success("Current index deleted.")
+        st.rerun()
+    else:
+        st.warning("No active index to delete.")
+
+if uploaded_pdf is not None:
+    current_pdf_bytes = uploaded_pdf.getvalue()
+    current_pdf_hash = sha256_bytes(current_pdf_bytes)
+
+    if st.session_state.upload_hash and st.session_state.upload_hash != current_pdf_hash:
+        st.session_state.messages = []
+        st.session_state.active_manifest = None
+
+    st.session_state.upload_hash = current_pdf_hash
+else:
+    current_pdf_bytes = b""
+    current_pdf_hash = ""
+
+if process_button:
+    if uploaded_pdf is None:
+        st.error("Please upload a PDF first.")
+    else:
+        try:
+            original_name = uploaded_pdf.name
+            safe_name = safe_filename(original_name)
+            pdf_path = SETTINGS.uploads_dir / f"{current_pdf_hash}_{safe_name}"
+            pdf_path.write_bytes(current_pdf_bytes)
+
+            index_config = {
+                "extractor": extractor_key,
+                "chunk_method": chunk_method,
+                "chunk_size": int(chunk_size),
+                "chunk_overlap": int(chunk_overlap),
+                "embedding_provider": embedding_provider,
+                "embedding_model": embedding_model,
+                "embedding_base_url": embedding_base_url,
+            }
+
+            collection_name = build_collection_name(current_pdf_hash, index_config)
+            manifest_path = SETTINGS.manifest_dir / f"{collection_name}.json"
+            markdown_cache_path = SETTINGS.markdown_cache_dir / f"{collection_name}.md"
+
+            embedder = build_embedder(
+                provider_name=embedding_provider,
+                model_name=embedding_model,
+                base_url=embedding_base_url or None,
+            )
+            vector_store = ChromaVectorStore(
+                persist_directory=SETTINGS.chroma_dir,
+                collection_name=collection_name,
+                embedder=embedder,
+            )
+
+            if manifest_path.exists() and vector_store.count() > 0:
+                manifest = read_json(manifest_path)
+                st.session_state.active_manifest = manifest
+                st.session_state.messages = []
+                st.success("Existing index loaded from cache.")
+            else:
+                with st.spinner("Extracting PDF..."):
+                    extracted = extract_pdf(
+                        pdf_path=pdf_path,
+                        extractor_key=extractor_key,
+                        doc_id=current_pdf_hash,
+                    )
+
+                if not extracted.markdown.strip():
+                    raise ValueError("Extraction returned empty text.")
+
+                with st.spinner("Chunking document..."):
+                    chunks = chunk_document(
+                        extracted=extracted,
+                        method=chunk_method,
+                        chunk_size=int(chunk_size),
+                        chunk_overlap=int(chunk_overlap),
+                    )
+
+                if not chunks:
+                    raise ValueError("Chunking returned zero chunks.")
+
+                with st.spinner("Embedding and indexing..."):
+                    vector_store.reset()
+                    vector_store.index_chunks(chunks)
+
+                markdown_cache_path.write_text(extracted.markdown, encoding="utf-8")
+
+                manifest = {
+                    "pdf_name": original_name,
+                    "pdf_path": str(pdf_path),
+                    "doc_hash": current_pdf_hash,
+                    "collection_name": collection_name,
+                    "extractor": extractor_key,
+                    "chunk_method": chunk_method,
+                    "chunk_size": int(chunk_size),
+                    "chunk_overlap": int(chunk_overlap),
+                    "chunk_count": len(chunks),
+                    "embedding_provider": embedding_provider,
+                    "embedding_model": embedding_model,
+                    "embedding_base_url": embedding_base_url,
+                    "manifest_path": str(manifest_path),
+                    "markdown_cache_path": str(markdown_cache_path),
+                }
+                write_json(manifest_path, manifest)
+
+                st.session_state.active_manifest = manifest
+                st.session_state.messages = []
+                st.success(f"Processing complete. Indexed {len(chunks)} chunks.")
+
+        except Exception as exc:
+            logger.exception("Processing failed")
+            st.error(f"Processing failed: {exc}")
+
+active_manifest = st.session_state.active_manifest
+
+if active_manifest:
+    st.success(
+        f"Ready: {active_manifest['pdf_name']} | extractor={active_manifest['extractor']} | "
+        f"chunking={active_manifest['chunk_method']} | chunks={active_manifest['chunk_count']}"
+    )
+    with st.expander("Active index details", expanded=False):
+        st.json(
+            {
+                "pdf_name": active_manifest["pdf_name"],
+                "extractor": active_manifest["extractor"],
+                "chunk_method": active_manifest["chunk_method"],
+                "chunk_size": active_manifest["chunk_size"],
+                "chunk_overlap": active_manifest["chunk_overlap"],
+                "chunk_count": active_manifest["chunk_count"],
+                "embedding_provider": active_manifest["embedding_provider"],
+                "embedding_model": active_manifest["embedding_model"],
+                "collection_name": active_manifest["collection_name"],
+            }
+        )
+else:
+    st.info("Upload a PDF and click 'Process / Load index'.")
+
+st.markdown("---")
+render_chat_history()
+
+question = st.chat_input(
+    "Ask something about the indexed PDF...",
+    disabled=active_manifest is None,
+)
+
+if question:
+    st.session_state.messages.append({"role": "user", "content": question})
+
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+        try:
+            manifest = st.session_state.active_manifest
+            if not manifest:
+                raise ValueError("No active index found.")
+
+            embedder = build_embedder(
+                provider_name=manifest["embedding_provider"],
+                model_name=manifest["embedding_model"],
+                base_url=manifest.get("embedding_base_url") or None,
+            )
+
+            vector_store = ChromaVectorStore(
+                persist_directory=SETTINGS.chroma_dir,
+                collection_name=manifest["collection_name"],
+                embedder=embedder,
+            )
+
+            rag = RAGService(vector_store=vector_store)
+            chat_client = build_chat_client(
+                provider_name=provider_name,
+                base_url=llm_base_url,
+                api_key=llm_api_key,
+            )
+
+            result = rag.answer(
+                question=question,
+                history=st.session_state.messages[:-1],
+                chat_client=chat_client,
+                model=llm_model,
+                temperature=float(temperature),
+                max_tokens=int(max_tokens),
+                top_k=int(retrieval_k),
+            )
+
+            answer = result["answer"]
+            sources = result["sources"]
+            chat_result = result["chat_result"]
+
+            meta_caption = build_meta_caption(
+                provider_name=provider_name,
+                model_name=llm_model,
+                chat_result=chat_result,
+                source_count=len(sources),
+            )
+
+            st.markdown(answer)
+            render_sources(sources)
+            st.caption(meta_caption)
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": sources,
+                    "meta_caption": meta_caption,
+                }
+            )
+
+        except Exception as exc:
+            logger.exception("Answer generation failed")
+            error_text = f"Error: {exc}"
+            st.error(error_text)
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": error_text,
+                    "sources": [],
+                    "meta_caption": "",
+                }
+            )

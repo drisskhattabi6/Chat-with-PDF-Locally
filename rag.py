@@ -1,208 +1,162 @@
-import logging
-import chromadb
-import tiktoken
-import time, os
 import numpy as np
 from rank_bm25 import BM25Okapi
-from nltk.tokenize import word_tokenize
 
-from llm_inference import LLMInference
+from schemas import ChatResult, RetrievalHit
+from utils import simple_tokenize, strip_think_tags
 
-from dotenv import load_dotenv
-load_dotenv()
 
-API_KEY = os.getenv('API_KEY')
+SYSTEM_PROMPT = """You are a grounded PDF question-answering assistant.
 
-class RAGSystem :
-    def __init__(
-            self, collection_name: str, 
-            db_path: str ="PDF_ChromaDB", 
-            n_results: int = 5
-        ) :
+Rules:
+1. Use only the provided source context.
+2. If the answer is incomplete or unsupported by the sources, say so clearly.
+3. Cite the source IDs inline like [S1], [S2].
+4. Do not invent facts outside the retrieved context.
+5. Prefer precise answers over long answers.
+"""
 
-        self.collection_name = collection_name
-        self.db_path = db_path
-        self.n_results = n_results
 
-        if not self.collection_name:
-            raise ValueError("'collection_name' parameter is required.")
+class RAGService:
+    def __init__(self, vector_store):
+        self.vector_store = vector_store
 
-        self.llm_inference = LLMInference()
+    def answer(
+        self,
+        question: str,
+        history: list[dict],
+        chat_client,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        top_k: int,
+    ) -> dict:
+        hits = self.vector_store.query(question, n_results=max(20, top_k * 4))
 
-        self.logger = self._setup_logging()
-        self.client = chromadb.PersistentClient(path=self.db_path)
-        self.collection = self.client.get_or_create_collection(name=self.collection_name)
-    
-    def _setup_logging(self) -> logging.Logger:
-        logger = logging.getLogger(__name__)
-        logger.setLevel(logging.INFO)
-        logger.handlers.clear()
-        
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        console_handler.setFormatter(formatter)
+        if not hits:
+            return {
+                "answer": "I couldn't find relevant indexed content for that question in the current PDF.",
+                "sources": [],
+                "chat_result": ChatResult(
+                    text="",
+                    provider="",
+                    model="",
+                    latency_s=0.0,
+                ),
+            }
 
-        logger.addHandler(console_handler)
-        return logger
-    
-    def _format_time(self, response_time):
-        minutes = response_time // 60
-        seconds = response_time % 60
-        return f"{int(minutes)}m {int(seconds)}s" if minutes else f"Time: {int(seconds)}s"
-    
-    def _generate_embeddings(self, text: str):
-        return self.llm_inference._generate_embeddings(input_text=text, model_name="nomic-embed-text:latest")
-    
-    def _get_tokens_count(self, text: str):
-        """Returns the number of tokens in the given text."""
-        encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-        return len(encoding.encode(text))
-    
-    def _retrieve(self, user_text: str, n_results: int = 10):
+        reranked_hits = self._rerank_hits(hits, question, top_k=top_k)
+        context_text, source_payload = self._build_context(reranked_hits)
 
-        embedding = self._generate_embeddings(user_text)
+        recent_history = history[-6:] if history else []
+        history_text = "\n".join(
+            f"{msg['role'].capitalize()}: {msg['content']}" for msg in recent_history
+        ).strip()
 
-        # Include document texts and their embeddings
-        results = self.collection.query(
-            query_embeddings=[embedding],
-            n_results=n_results,
-            include=["documents", "embeddings"]
+        user_prompt = f"""
+Conversation history:
+{history_text if history_text else "(none)"}
+
+Question:
+{question}
+
+Source context:
+{context_text}
+
+Answer the question using only the source context above.
+""".strip()
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        chat_result = chat_client.chat(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
 
-        if not results['documents']:
-            return []
+        answer_text = strip_think_tags(chat_result.text)
 
-        chunks = results['documents'][0]
-        embeddings = results['embeddings'][0]
+        return {
+            "answer": answer_text,
+            "sources": source_payload,
+            "chat_result": chat_result,
+        }
 
-        return chunks, embeddings
-    
-    def _rerank_docs(self, chunks: list[str], embeddings: list[list[float]], query: str, top_k: int = 5):
-        """Ranks text chunks using BM25 and precomputed semantic similarity."""
-        # ----- BM25 -----
-        tokenized_chunks = [word_tokenize(chunk.lower()) for chunk in chunks]
-        bm25 = BM25Okapi(tokenized_chunks)
-        bm25_scores = bm25.get_scores(word_tokenize(query.lower()))
+    def _rerank_hits(self, hits: list[RetrievalHit], query: str, top_k: int) -> list[RetrievalHit]:
+        if len(hits) <= top_k:
+            for hit in hits:
+                hit.score = 1.0
+            return hits
 
-        # ----- Semantic similarity using Ollama embeddings -----
-        query_embedding = np.array(self._generate_embeddings(query))
-        chunk_embeddings = np.array(embeddings)
+        tokenized_corpus = [simple_tokenize(hit.text) or ["_"] for hit in hits]
+        query_tokens = simple_tokenize(query)
 
-        # Cosine similarity
-        dot_product = np.dot(chunk_embeddings, query_embedding)
-        query_norm = np.linalg.norm(query_embedding)
-        chunk_norms = np.linalg.norm(chunk_embeddings, axis=1)
-        semantic_scores = dot_product / (chunk_norms * query_norm + 1e-10)
+        if query_tokens:
+            bm25 = BM25Okapi(tokenized_corpus)
+            bm25_scores = np.array(bm25.get_scores(query_tokens), dtype=float)
+        else:
+            bm25_scores = np.zeros(len(hits), dtype=float)
 
-        # ----- Score normalization -----
-        bm25_norm = (bm25_scores - np.min(bm25_scores)) / (np.max(bm25_scores) - np.min(bm25_scores) + 1e-5)
-        sem_norm = (semantic_scores - np.min(semantic_scores)) / (np.max(semantic_scores) - np.min(semantic_scores) + 1e-5)
-        combined_scores = 0.5 * bm25_norm + 0.5 * sem_norm
+        semantic_scores = []
+        for hit in hits:
+            distance = hit.distance if hit.distance is not None else 1.0
+            semantic_scores.append(1.0 / (1.0 + float(distance)))
+        semantic_scores = np.array(semantic_scores, dtype=float)
 
-        # ----- Top-k selection -----
-        ranked_indices = np.argsort(combined_scores)[::-1]
-        return [chunks[i] for i in ranked_indices[:top_k]]
-    
-    def _get_prompt(self, query, context) :
-        prompt = f"""
-    You are an AI assistant specialized in answering questions based **only** on the provided context. 
-    The context is a part of a document (PDF).
-    The context is structured with sections separated by `########`. 
+        bm25_norm = self._normalize(bm25_scores)
+        sem_norm = self._normalize(semantic_scores)
 
-    ### **Context:**  
-        '''  
-        {context}  
-        '''  
+        combined = (0.35 * bm25_norm) + (0.65 * sem_norm)
+        ranked_indices = np.argsort(combined)[::-1][:top_k]
 
-    ### **Question:**  
-        "{query}"  
+        reranked: list[RetrievalHit] = []
+        for idx in ranked_indices:
+            hit = hits[int(idx)]
+            hit.score = float(combined[int(idx)])
+            reranked.append(hit)
 
-    ### **Instructions:**  
-        - Answer concisely and accurately using only the given context.  
-        - Put what you find from the context **without summarizing**.
-        - Answer directly and concisely.
+        return reranked
 
-    ### **Answer:**
+    def _build_context(self, hits: list[RetrievalHit]) -> tuple[str, list[dict]]:
+        blocks: list[str] = []
+        source_payload: list[dict] = []
 
-    """
-        return prompt
-    
-            # - If the context is unclear, just give me what did you find.
-        # - If the context is missing state: "The provided context does not contain enough information." (but try to answer) 
-    
-    def generate_response(self, query: str, ollama_model):
-        """Generates a response using retrieved documents and an LLM."""
+        for idx, hit in enumerate(hits, start=1):
+            source_id = f"S{idx}"
+            metadata = dict(hit.metadata or {})
 
-        if not ollama_model :
-            return "Error: Choose an ollama LLM"
+            labels: list[str] = []
+            if metadata.get("page") is not None:
+                labels.append(f"page {metadata['page']}")
+            for key in ("h1", "h2", "h3", "h4"):
+                if metadata.get(key):
+                    labels.append(f"{key}: {metadata[key]}")
 
-        self.logger.info(f"--> Generate Response Using Ollama LLM : {ollama_model}")
+            label_text = ", ".join(labels) if labels else "no extra metadata"
 
-        chunks, embeddings = self._retrieve(query, n_results=20)
-        
-        if not chunks:
-            return "No relevant information found, may be the data base is empty."
-        
-        reranked_retrieved_docs = self._rerank_docs(chunks=chunks, embeddings=embeddings, query=query, top_k=self.n_results)
+            blocks.append(f"[{source_id}] ({label_text})\n{hit.text}")
+            source_payload.append(
+                {
+                    "id": source_id,
+                    "text": hit.text,
+                    "metadata": metadata,
+                    "score": round(hit.score, 4),
+                }
+            )
 
-        context = "\n\n########\n\n".join(reranked_retrieved_docs)
-        
-        prompt = self._get_prompt(query, context)
+        return "\n\n" + ("\n\n-----\n\n".join(blocks)) + "\n", source_payload
 
-        self.logger.info(f"-> User Query : {query}")
-        self.logger.info(f"-> Context : {context}")
+    @staticmethod
+    def _normalize(values: np.ndarray) -> np.ndarray:
+        if len(values) == 0:
+            return values
 
-        input_prompt_token_count = self._get_tokens_count(prompt)
-        start_time = time.time()
+        min_v = float(np.min(values))
+        max_v = float(np.max(values))
+        if abs(max_v - min_v) < 1e-12:
+            return np.ones_like(values)
 
-        response = self.llm_inference.generate_text(prompt=prompt, model_name=ollama_model, llm_provider='Ollama')
-
-        output_token_count = self._get_tokens_count(response)
-        response_time = time.time() - start_time
-        self.logger.info(f"-> LLM Response : {response}")
-        self.logger.info(f"-> Output token count : {output_token_count} | Input token count : {input_prompt_token_count} | response time : {self._format_time(response_time)}")
-
-        return response, self._format_time(response_time), self.n_results , input_prompt_token_count, output_token_count
-    
-    def generate_response2(self, query, llm_name='QwQ-32B', api_key=None) :
-
-        if not api_key and not API_KEY :
-            return "Set OpenRouter API Key"
-        
-        api_key = api_key if api_key else API_KEY
-
-        self.logger.info(f"--> Generate Response Using OpenRouter LLM : {llm_name}")
-
-        chunks, embeddings = self._retrieve(query, n_results=20)
-
-        if not chunks:
-            return "No relevant information found, may be the data base is empty."
-        
-        reranked_retrieved_docs = self._rerank_docs(chunks=chunks, embeddings=embeddings, query=query, top_k=self.n_results)
-
-        context = "\n\n########\n\n".join(reranked_retrieved_docs)
-
-        self.logger.info(f"-> Context : {context}")
-
-        prompt = self._get_prompt(query, context)
-
-        start_time = time.time()
-
-        response = self.llm_inference.generate_text(prompt=prompt, model_name=llm_name, llm_provider='Sambanova')
-
-        input_prompt_token_count = response[1]
-        output_token_count = self._get_tokens_count(response[0])
-        response_time = time.time() - start_time
-        self.logger.info(f"-> LLM Response : {response[0]}")
-        self.logger.info(f"-> Output token count : {output_token_count} | Input token count : {input_prompt_token_count}  |  response time : {self._format_time(response_time)}")
-        
-        return response[0], self._format_time(response_time), self.n_results , input_prompt_token_count, output_token_count
-
-    def delete_collection(self):
-        self.client.delete_collection(self.collection_name)
-
-if __name__ == "__main__":
-    rag_system = RAGSystem(collection_name="pdf_content", db_path="PDF_ChromaDB", n_results=5)
-    print(rag_system.generate_response2("What is the name of the book ?", "QwQ-32B"))
+        return (values - min_v) / (max_v - min_v)

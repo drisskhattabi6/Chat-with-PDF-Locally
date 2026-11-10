@@ -1,14 +1,26 @@
-# **ChatPDF** : Chat with PDF Locally 🤖
+
+# ChatPDF: Chat with PDF Locally 🤖
 
 ## Overview
 
-**ChatPDF** is an interactive web application that allows you to upload a PDF file and engage with it by querying specific information. The app processes the PDF using various techniques, such as extracting text directly or converting it to Markdown, and stores the information in a local database to generate responses to user queries. The app is powered by Ollama and integrates with the Langchain framework to generate accurate answers based on the content within the PDF. It's a powerful local RAG (Retrieval Augmented Generation) application that lets you chat with your PDF documents.
+**ChatPDF** is a local RAG (Retrieval-Augmented Generation) application that lets you upload a PDF, index its content, and chat with it through a simple Streamlit interface.
+
+This updated version is more modular and more robust than the original one:
+
+- supports **multiple PDF extraction engines**
+- supports **multiple LLM providers**
+- lets the user **choose the chunking strategy**
+- uses **persistent local vector search with ChromaDB**
+- shows **retrieved sources** used to answer questions
+- caches indexed PDFs to avoid unnecessary reprocessing
+
+The app is designed for local-first usage, but it can also connect to hosted providers through API keys.
 
 ![](./imgs/ChatPDF3.png)
 
 ---
 
-### Tutorial Demo
+## Demo
 
 ![Tutorial GIF](./imgs/tutorial.gif)
 
@@ -16,175 +28,473 @@
   Your browser does not support the video tag.
 </video>
 
+---
 
-## Technology stack
+## What's New in This Version
 
-- [LangChain](https://python.langchain.com/api_reference/reference.html)
-- [Streamlit](https://docs.streamlit.io/)
-- [Ollama](https://ollama.ai/)
-- [Marker](https://github.com/VikParuchuri/marker)
-- [ChromaDB](https://docs.trychroma.com/docs/overview/getting-started)
+Compared to the old version, this refactor includes:
+
+- **Marker removed**
+  - replaced with **Docling** as the balanced / medium PDF extractor
+- **Fast extractor kept**
+  - **PyMuPDF4LLM** is used as the fast / lightweight extractor
+- **More LLM providers**
+  - Ollama
+  - OpenAI
+  - Groq
+  - OpenRouter
+  - SambaNova
+- **Selectable chunking methods**
+  - Recursive character
+  - Markdown headers + recursive
+  - Token-based
+  - Page-aware recursive
+- **Better indexing**
+  - PDF hash-based caching
+  - collection naming based on document + configuration
+- **Cleaner architecture**
+  - extraction, chunking, embeddings, providers, vector store, and RAG logic are split into separate files
+- **Source-aware answers**
+  - the app shows retrieved chunks used to build the answer
+
+---
+
+## Technology Stack
+
+- [Streamlit](https://streamlit.io/)
+- [ChromaDB](https://www.trychroma.com/)
+- [PyMuPDF4LLM](https://pymupdf.readthedocs.io/)
+- [Docling](https://docling-project.github.io/docling/)
+- [SentenceTransformers](https://www.sbert.net/)
+- [Ollama](https://ollama.com/)
 - Python
+
+---
 
 ## Features
 
-- **PDF Processing**: Extract text from PDFs directly or use advanced processing to convert PDFs to Markdown.
-- **RAG Workflow**: Combines retrieval and generation for high-quality responses.
-- **Customizable Retrieval**: Adjust the number of retrieved results (`n_results`) for context.
-- **Memory Management**: Easily clear vector store and retrievers to reset the system.
-- **Question Answering**: Use the processed PDF content to answer queries through a chatbot interface.
-- **Model Selection**: Choose between model provider (Ollama or Sambanova), than choose an available Ollama LLM or enter Sambanova LLM Name with API Key.
-- **Text Retrieval**: Retrieve relevant documents from the database based on the user's query and Re-Rank the retrieved documents using BM25, semantic similarity, Recomp-like coverage, and context filtering.
-- **Chat Interface**: Easy-to-use chat interface for interacting with the PDF content.
-- **Download the chat conversion**.
+- **PDF Extraction**
+  - Fast extraction with **PyMuPDF4LLM**
+  - Balanced extraction with **Docling**
+- **Flexible Chunking**
+  - choose the chunking method that fits your document
+- **Multiple LLM Providers**
+  - local or hosted models
+- **Local Vector Search**
+  - embeddings stored in a persistent ChromaDB database
+- **Hybrid Retrieval**
+  - vector retrieval + BM25 reranking
+- **Source Display**
+  - answers include the retrieved source chunks
+- **Chat Export**
+  - download the conversation as a PDF
+- **Caching**
+  - already indexed PDFs can be loaded again without reprocessing
 
-## 🚀 Getting Started
+---
 
-1. **Clone the Repository**:
-   Clone the repository to your local machine:
-   ```bash
-   git clone https://github.com/drisskhattabi6/Chat-with-PDF-Locally.git
-   cd Chat-with-PDF-Locally
-   ```
+## Supported Providers
 
-2. **Install Dependencies**:
-   Install the necessary dependencies using `pip`:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### LLM Providers
+- **Ollama** (local)
+- **OpenAI**
+- **Groq**
+- **OpenRouter**
+- **SambaNova**
 
-3. **Install Ollama**:
-   The app requires Ollama for language models. Follow the [Ollama installation instructions](https://ollama.com/) to install it.
+### Embedding Providers
+- **SentenceTransformers** (local)
+- **Ollama embeddings**
 
-   - Pull required models:
-     ```bash
-     ollama pull nomic-embed-text:latest  # required
-     ollama pull qwen2.5:latest  # or your preferred model
-     ```
-
-### 🎮 Running the Application
-
-Run the app using the following command:
-
-   ```bash
-   streamlit run app.py
-   ```
-
-Then open your browser to `http://localhost:8501` (it will open automatically)
-
-![](./imgs/App.png)
+---
 
 ## Project Structure
 
 ```bash
 .
-├── app.py                  # Streamlit app for the user interface
-├── rag.py                  # RAG System
-├── md_convertor.py         # PDF to Markdown Convertor
-├── requirements.txt        # List of required Python dependencies
-├── imgs/                   # some screanshots, logo and video
-├── PDF_ChromaDB/           # Local persistent vector store (auto-generated)
-└── README.md               # Project documentation
+├── app.py                  # Streamlit app
+├── config.py               # App settings and environment loading
+├── schemas.py              # Shared data structures
+├── utils.py                # Helpers and utility functions
+├── pdf_extractors.py       # PDF extraction engines
+├── chunking.py             # Chunking methods
+├── embeddings.py           # Embedding providers
+├── vector_store.py         # ChromaDB wrapper
+├── providers.py            # LLM provider clients
+├── rag.py                  # RAG pipeline and reranking
+├── requirements.txt        # Dependencies
+├── .env.example            # Example environment variables
+├── imgs/                   # Screenshots, logo, demo media
+├── data/                   # Auto-generated app data
+└── README.md
 ```
 
 ---
 
-## How it Works
+## How It Works
 
-1. **Upload PDF**:
-   After you upload a PDF file, the app will process the content using two modes:
-   - **Simple Processing**: Extracts the text directly from the PDF (faster).
-   - **Advanced Processing**: Converts the PDF into Markdown format using OCR and extracts the text (slower).
+1. **Upload a PDF**
+   - the app saves the file locally
+   - computes a file hash
+   - checks whether the same document + same config was already indexed
 
-2. **LLM Provider Selection**: Once the PDF is processed,Select you llm provider
-   - OLLAMA : Running Loccaly, You can select a model from a list of available Ollama models.
-   - Sambanova : using API, get API Key from `https://cloud.sambanova.ai/apis`
+2. **Choose a PDF extractor**
+   - **PyMuPDF4LLM**: faster and lighter
+   - **Docling**: more balanced and often better for structured PDFs
 
-3. **Query the Content**:
-   After the processing is complete, you can ask questions based on the content of the PDF. The app will use the Chroma vector database to search for relevant information and generate an accurate response using the selected Ollama model.
+3. **Choose a chunking method**
+   - Recursive character
+   - Markdown headers + recursive
+   - Token
+   - Page-aware recursive
 
-4. **Embedding & Vector Database**:
-   The app generates embeddings from the PDF content and stores them in a Chroma vector database. This allows fast retrieval of relevant text based on user queries.
+4. **Choose an embedding provider**
+   - SentenceTransformers
+   - Ollama embeddings
 
-### This is the Architecture of the APP
+5. **Index the document**
+   - extracted text is chunked
+   - embeddings are generated
+   - chunks are stored in ChromaDB
+
+6. **Ask questions**
+   - relevant chunks are retrieved
+   - reranked using vector similarity + BM25
+   - the selected LLM answers using only the retrieved context
+
+7. **Inspect sources**
+   - the app displays the source chunks used to generate the answer
+
+---
+
+## Architecture
+
+### High-level pipeline
+
+```text
+PDF Upload
+   ↓
+PDF Extraction
+   ↓
+Chunking
+   ↓
+Embeddings
+   ↓
+ChromaDB Index
+   ↓
+Retrieval + Reranking
+   ↓
+LLM Answer Generation
+   ↓
+Answer + Sources
+```
+
+You can still keep your existing screenshots and diagrams:
 
 ![](./imgs/Pre-processing.png)
 
 ![](./imgs/img6.png)
 
-## Features Breakdown
+---
 
-- **PDF Conversion**: The app uses the Marker library to convert PDFs to Markdown format. The conversion can be customized to remove images.
-- **Text Chunking**: Large documents are split into manageable chunks for easier processing.
-- **Embedded Models**: The app supports Ollama models for document embeddings and generating answers based on the content.
-- **Chroma Vector Store**: All the processed documents are stored in a Chroma vector store for efficient retrieval.
-- **RAG**: Advanced RAG implementation using LangChain
+## Requirements
 
-## How to Use
+- **Python 3.10+**
+- `pip`
+- for local LLM usage: **Ollama**
+- for cloud providers: the relevant **API key**
+- enough RAM/CPU depending on model size and PDF complexity
 
-1. **Upload PDF**: Upload a PDF file using the file uploader in the sidebar.
-2. **Choose Processing Mode**: Select between "Simple Processing" and "Advanced Processing."
-3. **Start Processing**: Click the "Start Processing" button to begin the conversion and embedding process.
-4. **Select Model**: Choose the Ollama model to generate the answers.
-5. **Customizable Retrieval**: and you can adjust the number of retrieved results (`n_results`) for context.
-6. **Ask Questions**: After processing is complete, ask questions related to the content of the PDF.
-7. **Download conversion**: Download the chat conversion using the "Download" button.
-8. **Clear Chat**: Clear the chat history using the "Clear Chat" button.
-
-### Some Screenshots
-
-### Sidebar
-
-- Full Screen :
-
-![](./imgs/sidebar.png)
-
-- PDF Processing :
-
-![](./imgs/pdf_processing.png)
+> Note: Python 3.10+ is recommended for compatibility with the current refactored stack.
 
 ---
 
-- LLM Providers : Ollama
+## Installation
 
+### 1) Clone the repository
+
+```bash
+git clone https://github.com/drisskhattabi6/Chat-with-PDF-Locally.git
+cd Chat-with-PDF-Locally
+```
+
+### 2) Create and activate a virtual environment
+
+#### Linux / macOS
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+#### Windows
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+### 3) Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4) Create your environment file
+
+Copy `.env.example` to `.env` and update it if needed.
+
+Example:
+
+```bash
+APP_TITLE="Chat with PDF"
+APP_PUBLIC_URL="http://localhost:8501"
+
+OLLAMA_BASE_URL="http://localhost:11434"
+
+OPENAI_API_KEY=""
+GROQ_API_KEY=""
+OPENROUTER_API_KEY=""
+SAMBANOVA_API_KEY=""
+
+DEFAULT_CHUNK_SIZE="900"
+DEFAULT_CHUNK_OVERLAP="120"
+DEFAULT_RETRIEVAL_K="6"
+
+EMBEDDING_PROVIDER="sentence_transformers"
+EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+```
+
+---
+
+## Optional: Install Ollama
+
+If you want to use **local LLMs** or **Ollama embeddings**, install Ollama first.
+
+Then pull the models you want, for example:
+
+```bash
+ollama pull qwen2.5:latest
+ollama pull nomic-embed-text:latest
+```
+
+You can use any Ollama chat model you prefer.
+
+---
+
+## Run the App
+
+```bash
+streamlit run app.py
+```
+
+Then open:
+
+```bash
+http://localhost:8501
+```
+
+![](./imgs/App.png)
+
+---
+
+## How to Use
+
+1. **Upload a PDF**
+2. **Select a PDF extractor**
+   - Fast / Small: PyMuPDF4LLM
+   - Balanced / Medium: Docling
+3. **Select a chunking method**
+4. **Select the embedding provider**
+5. **Click `Process / Load index`**
+6. **Select the LLM provider**
+7. **Choose or enter the model name**
+8. **Ask questions about the PDF**
+9. **Inspect the retrieved sources**
+10. **Download the chat as PDF if needed**
+
+---
+
+## Chunking Methods
+
+The app lets you choose how the extracted text is split before indexing.
+
+### 1. Recursive character
+A general-purpose splitter based on text separators.
+
+Best for:
+- most standard PDFs
+- general usage
+
+### 2. Markdown headers + recursive
+First splits by markdown headers, then recursively splits large sections.
+
+Best for:
+- structured reports
+- manuals
+- research documents
+
+### 3. Token
+Splits text by token count instead of character count.
+
+Best for:
+- model-aware chunk sizing
+- tighter chunk budget control
+
+### 4. Page-aware recursive
+Splits text page by page, then recursively chunks each page.
+
+Best for:
+- page-based citation workflows
+- preserving page locality
+
+> Page-aware chunking works best when the selected extractor returns page-level content.
+
+---
+
+## PDF Extractors
+
+### PyMuPDF4LLM
+- faster
+- lightweight
+- useful for searchable PDFs
+- supports page-aware extraction
+
+### Docling
+- more balanced than a very heavy OCR-style pipeline
+- good for structured and moderately complex PDFs
+- better suited than the old large extraction approach for this app version
+
+---
+
+## Screenshots
+
+### Sidebar
+
+![](./imgs/sidebar.png)
+
+### PDF Processing
+
+![](./imgs/pdf_processing.png)
+
+### Providers
+
+#### Ollama
 ![](./imgs/provider1.png)
 ![](./imgs/provider1-1.png)
 
-- LLM Providers : Sambanova
-
+#### SambaNova
 ![](./imgs/provider2.png)
 ![](./imgs/provider2-2.png)
 
-#### Chat Interface
+### Chat Interface
 
 ![](./imgs/img3.png)
 
 ![](./imgs/chat1.png)
 
-## Requirements
+---
 
-- Python 3.8+
-- Pip
-- Ollama models installed via `ollama pull`
-- Sambanova API Key
-- Marker library for PDF to Markdown conversion
-- Chroma for storing vector embeddings
+## Notes About the Refactor
 
-## Troubleshooting
+This version removes the old files:
 
-- if you want to use Sambanova, get the API Key, put it in '.env' file or in input text in UI.
-- in '.env' file, set your Sambanova API Key:
+- `llm_inference.py`
+- `md_convertor.py`
 
-```bash
-API_KEY='your_api_key'
-```
+Their responsibilities are now handled by:
 
-- make sure that all libraries from 'requirements.txt' are installed, espisally 'Marker' -> `pip install marker-pdf`
-- make sure that ollama is running locally.
-- If no Ollama models are found, ensure that Ollama is properly installed and models are pulled using `ollama pull <model_name>`.
-- Ensure that the PDF file uploaded is valid and can be processed by the app.
-- The chatbot depends on your performence of your labtop, so please be patient!
+- `providers.py`
+- `pdf_extractors.py`
+
+This makes the app easier to extend and maintain.
 
 ---
 
-Follow me on [LinkedIn](https://www.linkedin.com/in/idriss-khattabi-b3a266235/)
+## Troubleshooting
+
+### 1) No Ollama models found
+Make sure Ollama is installed and running:
+
+```bash
+ollama list
+```
+
+If needed, pull a model:
+
+```bash
+ollama pull qwen2.5:latest
+```
+
+### 2) Embedding model fails
+If you use Ollama embeddings, make sure the embedding model is installed:
+
+```bash
+ollama pull nomic-embed-text:latest
+```
+
+If you use SentenceTransformers, verify the model name is valid.
+
+### 3) API provider does not respond
+Check:
+- API key is correct
+- base URL is correct
+- selected model exists for that provider
+
+### 4) PDF processing returns empty text
+This can happen if:
+- the PDF is image-only
+- the file is corrupted
+- the selected extractor is not suitable for that document
+
+Try:
+- switching extractor
+- using Docling instead of the fast extractor
+- testing with another PDF
+
+### 5) Index loads but answers are weak
+Try:
+- increasing retrieval `k`
+- changing the chunking strategy
+- using smaller or larger chunk size
+- switching extractor for better structure
+
+### 6) Streamlit app is slow
+Possible reasons:
+- very large PDF
+- large embedding model
+- slow local machine
+- remote provider latency
+
+### 7) Provider model list fails
+Some hosted providers may require a valid API key before model listing works.
+
+---
+
+## Known Limitations
+
+- performance depends on your hardware and chosen models
+- very large PDFs may take time to process
+- extraction quality depends on PDF structure
+- hosted provider quality depends on selected model
+- some chunking methods are better suited for specific document types than others
+
+---
+
+## Future Improvements
+
+Possible next improvements:
+
+- multi-PDF collections
+- citations with exact page rendering
+- chat history persistence
+- Docker support
+- model presets
+- OCR fallback pipeline for image-only PDFs
+- evaluation dashboard for chunking and retrieval quality
+
+---
+
+## Author
+
+If you want, you can keep your original contact section here:
+
+[LinkedIn](https://www.linkedin.com/in/idriss-khattabi-b3a266235/)

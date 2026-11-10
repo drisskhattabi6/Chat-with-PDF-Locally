@@ -1,8 +1,23 @@
-PDF_ChromaDB/
-tmp/
-*.log
-*.bin
-*.sqlite3
-.pyc
+# Python
 __pycache__/
-__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Env
+.env
+
+# Streamlit / logs
+*.log
+
+# App data
+data/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+trash/
